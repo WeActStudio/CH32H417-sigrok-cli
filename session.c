@@ -2,7 +2,7 @@
  * This file is part of the sigrok-cli project.
  *
  * Copyright (C) 2013 Bert Vermeulen <bert@biot.com>
- *
+ * Copyright (C) 2026 OpenChipLab
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
@@ -25,12 +25,122 @@
 #include <stdlib.h>
 #include "sigrok-cli.h"
 
+struct memory_buffer {
+	uint8_t **chunks;       
+	size_t *chunk_sizes;   
+	size_t chunk_count;     
+	size_t chunk_capacity;  
+	size_t unit_size;       
+	uint64_t total_samples; 
+	uint64_t samplerate;   
+};
+
 static uint64_t limit_samples = 0;
 static uint64_t limit_frames = 0;
 
 #ifdef HAVE_SRD
 extern struct srd_session *srd_sess;
 #endif
+
+static void memory_buffer_add_chunk(struct memory_buffer *mbuf,
+		const void *data, size_t length, size_t unit_size)
+{
+	if (!mbuf || !data || !length)
+		return;
+
+	if (mbuf->chunk_count >= mbuf->chunk_capacity) {
+		mbuf->chunk_capacity = mbuf->chunk_capacity ? mbuf->chunk_capacity * 2 : 64;
+		mbuf->chunks = g_realloc(mbuf->chunks, sizeof(uint8_t *) * mbuf->chunk_capacity);
+		mbuf->chunk_sizes = g_realloc(mbuf->chunk_sizes, sizeof(size_t) * mbuf->chunk_capacity);
+	}
+
+	mbuf->chunks[mbuf->chunk_count] = g_memdup(data, length);
+	mbuf->chunk_sizes[mbuf->chunk_count] = length;
+	mbuf->chunk_count++;
+	if (unit_size > 0) {
+		mbuf->unit_size = unit_size;
+		mbuf->total_samples += length / unit_size;
+	}
+}
+
+static void memory_buffer_free(struct memory_buffer *mbuf)
+{
+	size_t i;
+
+	if (!mbuf)
+		return;
+	for (i = 0; i < mbuf->chunk_count; i++)
+		g_free(mbuf->chunks[i]);
+	g_free(mbuf->chunks);
+	g_free(mbuf->chunk_sizes);
+	g_free(mbuf);
+}
+
+static void save_from_memory(const struct sr_output *o,
+		const struct sr_output *oa, FILE *outfile,
+		struct memory_buffer *mbuf)
+{
+	struct sr_datafeed_packet packet;
+	struct sr_datafeed_logic logic;
+	struct sr_datafeed_meta meta;
+	struct sr_config src;
+	GVariant *gvar;
+	GString *out = NULL;
+	size_t i;
+
+	if (!o || !mbuf || mbuf->chunk_count == 0)
+		return;
+
+	g_message("cli: Saving %zu chunks (%" PRIu64 " samples) to file.",
+		mbuf->chunk_count, mbuf->total_samples);
+
+	memset(&packet, 0, sizeof(packet));
+	memset(&meta, 0, sizeof(meta));
+	memset(&src, 0, sizeof(src));
+	src.key = SR_CONF_SAMPLERATE;
+	gvar = g_variant_new_uint64(mbuf->samplerate);
+	src.data = gvar;
+	meta.config = g_slist_append(NULL, &src);
+	packet.type = SR_DF_META;
+	packet.payload = &meta;
+	if (sr_output_send(o, &packet, &out) == SR_OK) {
+		if (out) { g_string_free(out, TRUE); out = NULL; }
+	}
+	g_slist_free(meta.config);
+
+	memset(&packet, 0, sizeof(packet));
+	packet.type = SR_DF_LOGIC;
+	packet.payload = &logic;
+	logic.unitsize = mbuf->unit_size;
+	for (i = 0; i < mbuf->chunk_count; i++) {
+		logic.data = mbuf->chunks[i];
+		logic.length = mbuf->chunk_sizes[i];
+		if (sr_output_send(o, &packet, &out) == SR_OK) {
+			if (oa && !out)
+				sr_output_send(oa, &packet, &out);
+			if (outfile && out && out->len > 0) {
+				fwrite(out->str, 1, out->len, outfile);
+				fflush(outfile);
+			}
+			if (out) { g_string_free(out, TRUE); out = NULL; }
+		}
+	}
+
+	memset(&packet, 0, sizeof(packet));
+	packet.type = SR_DF_END;
+	packet.payload = NULL;
+	if (sr_output_send(o, &packet, &out) == SR_OK) {
+		if (oa && !out)
+			sr_output_send(oa, &packet, &out);
+		if (outfile && out && out->len > 0) {
+			fwrite(out->str, 1, out->len, outfile);
+			fflush(outfile);
+		}
+		if (out) { g_string_free(out, TRUE); out = NULL; }
+	}
+
+	g_message("cli: Save complete.");
+}
 
 static int set_limit_time(const struct sr_dev_inst *sdi)
 {
@@ -261,6 +371,7 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 	static uint64_t samplerate = 0;
 	static int triggered = 0;
 	static FILE *outfile = NULL;
+	static struct memory_buffer *mbuf = NULL;
 
 	const struct sr_datafeed_meta *meta;
 	const struct sr_datafeed_logic *logic;
@@ -271,14 +382,12 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 	struct sr_session *session;
 	struct sr_config *src;
 	GSList *l;
-	GString *out;
 	GVariant *gvar;
 	uint64_t end_sample;
 	uint64_t input_len;
 	struct sr_dev_driver *driver;
 
 	/* Avoid warnings when building without decoder support. */
-	(void)session;
 	(void)input_len;
 
 	driver = sr_dev_inst_driver_get(sdi);
@@ -319,6 +428,16 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 			oa = sr_output_new(sr_output_find("analog"), NULL,
 					sdi, NULL);
 
+		if (!opt_pds && opt_output_file) {
+			if (mbuf) {
+				memory_buffer_free(mbuf);
+				mbuf = NULL;
+			}
+			mbuf = g_malloc0(sizeof(struct memory_buffer));
+			mbuf->samplerate = samplerate;
+			g_debug("Memory-first capture mode: buffering logic data in memory");
+		}
+
 		rcvd_samples_logic = rcvd_samples_analog = 0;
 
 #ifdef HAVE_SRD
@@ -348,6 +467,8 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 			case SR_CONF_SAMPLERATE:
 				samplerate = g_variant_get_uint64(src->data);
 				g_debug("cli: Got samplerate %"PRIu64" Hz.", samplerate);
+				if (mbuf)
+					mbuf->samplerate = samplerate;
 				if (do_props) {
 					props->samplerate = samplerate;
 					break;
@@ -419,6 +540,19 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 		if (limit_samples && end_sample > limit_samples)
 			end_sample = limit_samples;
 		input_len = (end_sample - rcvd_samples_logic) * logic->unitsize;
+
+		if (mbuf && input_len > 0) {
+			memory_buffer_add_chunk(mbuf, logic->data, input_len,
+				logic->unitsize);
+			rcvd_samples_logic = end_sample;
+
+			if (limit_samples && rcvd_samples_logic >= limit_samples) {
+				g_message("cli: Sample limit reached (%" PRIu64 "), stopping session.",
+					rcvd_samples_logic);
+				sr_session_stop(session);
+			}
+			break;
+		}
 
 		if (opt_pds) {
 #ifdef HAVE_SRD
@@ -572,7 +706,8 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 		break;
 	}
 
-	if (!do_props && o && !opt_pds) {
+	if (!do_props && o && !opt_pds && !mbuf) {
+		GString *out = NULL;
 		if (sr_output_send(o, packet, &out) == SR_OK) {
 			if (oa && !out) {
 				/*
@@ -595,7 +730,16 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 	 * is called, so it can properly clean up that module.
 	 */
 	if (packet->type == SR_DF_END) {
-		g_message("cli: Received SR_DF_END, sending EOF to decoder.");
+		g_message("cli: Received SR_DF_END.");
+		if (mbuf && mbuf->chunk_count > 0) {
+			g_message("cli: Writing %" PRIu64 " samples to file...",
+				mbuf->total_samples);
+			save_from_memory(o, oa, outfile, mbuf);
+		}
+		if (mbuf) {
+			memory_buffer_free(mbuf);
+			mbuf = NULL;
+		}
 
 #if defined HAVE_SRD_SESSION_SEND_EOF && HAVE_SRD_SESSION_SEND_EOF
 		(void)srd_session_send_eof(srd_sess);
