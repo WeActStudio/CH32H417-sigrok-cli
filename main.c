@@ -103,14 +103,69 @@ int select_channels(struct sr_dev_inst *sdi)
 	return SR_OK;
 }
 
+/*
+ * Put the sample rate back to what it was before the width was switched.
+ *
+ * Switching between 8 and 16 channels swaps the table of rates the device
+ * offers, and the driver moves to the top of the new one: on a USB 2.0
+ * link 16 channels start at 20 MHz and 8 channels at 40 MHz. Left alone
+ * that doubles the rate, and --time then asks for twice as many samples
+ * in the same number of bytes, which is the opposite of what the narrow
+ * width is for. A rate the user asked for is applied afterwards by
+ * set_dev_options_array(), so it still wins over this.
+ */
+static void restore_samplerate(struct sr_dev_inst *sdi, uint64_t samplerate)
+{
+	struct sr_dev_driver *driver;
+	GVariant *gvar;
+	uint64_t now;
+	int ret;
+
+	driver = sr_dev_inst_driver_get(sdi);
+
+	if (maybe_config_get(driver, sdi, NULL, SR_CONF_SAMPLERATE, &gvar) != SR_OK)
+		return;
+	now = g_variant_get_uint64(gvar);
+	g_variant_unref(gvar);
+
+	if (now == samplerate)
+		return;
+
+	ret = maybe_config_set(driver, sdi, NULL, SR_CONF_SAMPLERATE,
+			g_variant_new_uint64(samplerate));
+	if (ret == SR_OK) {
+		g_debug("Kept the sample rate at %" PRIu64 " Hz.", samplerate);
+		return;
+	}
+
+	/*
+	 * The new width does not offer that rate any more, 40 MHz going
+	 * back to 16 channels being the case that shows it. The driver has
+	 * already moved to the top of the new table, which is the fastest
+	 * rate that is left, so there is nothing better to pick here.
+	 */
+	g_debug("Could not keep the sample rate at %" PRIu64 " Hz: %s.",
+		samplerate, sr_strerror(ret));
+}
+
 int apply_logic_channel_count(struct sr_dev_inst *sdi)
 {
+	struct sr_dev_driver *driver;
+	GVariant *gvar;
+	uint64_t samplerate;
 	int ret;
 
 	if (!logic_channel_count_needed)
 		return SR_OK;
 
-	ret = maybe_config_set(sr_dev_inst_driver_get(sdi), sdi, NULL,
+	driver = sr_dev_inst_driver_get(sdi);
+	samplerate = 0;
+	if (maybe_config_get(driver, sdi, NULL, SR_CONF_SAMPLERATE, &gvar) == SR_OK) {
+		samplerate = g_variant_get_uint64(gvar);
+		g_variant_unref(gvar);
+	}
+
+	ret = maybe_config_set(driver, sdi, NULL,
 			SR_CONF_NUM_LOGIC_CHANNELS,
 			g_variant_new_int32(logic_channel_count_needed));
 
@@ -129,6 +184,9 @@ int apply_logic_channel_count(struct sr_dev_inst *sdi)
 	}
 
 	g_debug("Channel count set to %d.", logic_channel_count_needed);
+
+	if (samplerate)
+		restore_samplerate(sdi, samplerate);
 
 	return SR_OK;
 }
