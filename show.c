@@ -732,7 +732,7 @@ void show_dev_detail(void)
 				g_variant_unref(gvar);
 				if (i)
 					printf(", ");
-				printf("%.1f-%.1f", dlow, dhigh);
+				printf("%.2f-%.2f", dlow, dhigh);
 				if (!have_curr)
 					continue;
 				if (dlow == dcur_low && dhigh == dcur_high)

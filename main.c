@@ -23,6 +23,19 @@
 #include "sigrok-cli.h"
 
 struct sr_context *sr_ctx = NULL;
+
+/*
+ * Bit i set means channel i was asked for with -C. Zero means the option was
+ * not given at all, which leaves every channel of the device in play.
+ */
+uint64_t selected_channel_mask = 0;
+
+/*
+ * How many logic channels the device has to be put into before the
+ * capture, 8 or 16. Zero means that nothing was asked for and that the
+ * device is left on whatever it came up with.
+ */
+int logic_channel_count_needed = 0;
 #ifdef HAVE_SRD
 struct srd_session *srd_sess = NULL;
 #endif
@@ -60,17 +73,63 @@ int select_channels(struct sr_dev_inst *sdi)
 		if (!(selected_channels = parse_channelstring(sdi, opt_channels)))
 			return SR_ERR;
 
+		selected_channel_mask = 0;
 		for (l = channels; l; l = l->next) {
 			ch = l->data;
 			enabled = (g_slist_find(selected_channels, ch) != NULL);
 			if (sr_dev_channel_enable(ch, enabled) != SR_OK)
 				return SR_ERR;
+			if (enabled && ch->index >= 0 && ch->index < 64)
+				selected_channel_mask |= (uint64_t)1 << ch->index;
 		}
 		g_slist_free(selected_channels);
+
+		/*
+		 * The device ships either 8 or 16 channels, and the wider
+		 * of the two costs two bytes per sample instead of one. Take
+		 * the narrow one whenever every channel that was asked for
+		 * fits into it: that halves what travels over USB and what
+		 * the capture costs in memory, and the channels that were
+		 * asked for keep their numbers.
+		 */
+		if (selected_channel_mask && !(selected_channel_mask & ~0xffULL))
+			logic_channel_count_needed = 8;
+		else
+			logic_channel_count_needed = 16;
 	}
 #ifdef HAVE_SRD
 	map_pd_channels(sdi);
 #endif
+	return SR_OK;
+}
+
+int apply_logic_channel_count(struct sr_dev_inst *sdi)
+{
+	int ret;
+
+	if (!logic_channel_count_needed)
+		return SR_OK;
+
+	ret = maybe_config_set(sr_dev_inst_driver_get(sdi), sdi, NULL,
+			SR_CONF_NUM_LOGIC_CHANNELS,
+			g_variant_new_int32(logic_channel_count_needed));
+
+	/* Not every device can be told how wide to go. */
+	if (ret == SR_ERR_NA)
+		return SR_OK;
+
+	if (ret != SR_OK) {
+		/*
+		 * The capture is still good at the width the device is on,
+		 * only the saving is lost, so carry on and say so.
+		 */
+		g_warning("Could not set the channel count to %d: %s.",
+			logic_channel_count_needed, sr_strerror(ret));
+		return SR_OK;
+	}
+
+	g_debug("Channel count set to %d.", logic_channel_count_needed);
+
 	return SR_OK;
 }
 
@@ -228,8 +287,55 @@ static void set_options(void)
 	sr_dev_close(sdi);
 }
 
+#ifdef _WIN32
+#include <windows.h>
+#include <wchar.h>
+// 辅助：获取exe自身所在目录，等价于bat %~dp0
+static int get_exe_dir(wchar_t *out, int bufsize)
+{
+    DWORD ret = GetModuleFileNameW(NULL, out, bufsize);
+    if (ret == 0 || ret == (DWORD)bufsize)
+        return -1;
+
+    wchar_t *p = wcsrchr(out, L'\\');
+    if (p)
+        *(p+1) = L'\0';
+    return 0;
+}
+#endif
+
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
+	wchar_t exe_dir[1024];
+    if(get_exe_dir(exe_dir, _countof(exe_dir)) != 0)
+    {
+        fprintf(stderr, "Get exe path failed\n");
+        return 1;
+    }
+
+    wchar_t buf[1024];
+
+    // 1. PATH = %~dp0;%PATH%
+    swprintf(buf, _countof(buf), L"%ls", exe_dir);
+    SetEnvironmentVariableW(L"PATH", buf);
+
+    // 2. PYTHONHOME=%~dp0python-portable
+    swprintf(buf, _countof(buf), L"%lspython-portable", exe_dir);
+    SetEnvironmentVariableW(L"PYTHONHOME", buf);
+
+    // 3. PYTHONPATH=%~dp0python-portable\lib\python3.14
+    swprintf(buf, _countof(buf), L"%lspython-portable\\lib\\python3.14", exe_dir);
+    SetEnvironmentVariableW(L"PYTHONPATH", buf);
+
+    // 4. SIGROKDECODE_DIR=%~dp0decoders
+    swprintf(buf, _countof(buf), L"%lsdecoders", exe_dir);
+    SetEnvironmentVariableW(L"SIGROKDECODE_DIR", buf);
+
+    // 5. PYTHONDONTWRITEBYTECODE=1
+    SetEnvironmentVariableW(L"PYTHONDONTWRITEBYTECODE", L"1");
+#endif
+
 	g_log_set_default_handler(logger, NULL);
 
 	if (parse_options(argc, argv)) {

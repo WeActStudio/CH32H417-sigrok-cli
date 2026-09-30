@@ -31,7 +31,15 @@
 
 /* main.c */
 extern struct sr_context *sr_ctx;
+/*
+ * Bit i is set when channel i was asked for on the command line. Zero means
+ * that no such option was given and that every channel of the device is
+ * wanted; see drop_high_bytes() in session.c for what it is used for.
+ */
+extern uint64_t selected_channel_mask;
+extern int logic_channel_count_needed;
 int select_channels(struct sr_dev_inst *sdi);
+int apply_logic_channel_count(struct sr_dev_inst *sdi);
 int maybe_config_get(struct sr_dev_driver *driver,
 		const struct sr_dev_inst *sdi, struct sr_channel_group *cg,
 		uint32_t key, GVariant **gvar);

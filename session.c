@@ -25,6 +25,24 @@
 #include <stdlib.h>
 #include "sigrok-cli.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#elif !defined(_WIN32)
+#include <sys/sysinfo.h>
+#endif
+
+/*
+ * How much of the memory that is left the buffer is allowed to take before
+ * the capture is stopped, in percent. The data of a capture is held in memory
+ * in full (see memory_buffer below), so it grows with the capture.
+ */
+#define MEMORY_BUFFER_SHARE_PERCENT 50
+
 struct memory_buffer {
 	uint8_t **chunks;       
 	size_t *chunk_sizes;   
@@ -33,6 +51,8 @@ struct memory_buffer {
 	size_t unit_size;       
 	uint64_t total_samples; 
 	uint64_t samplerate;   
+	size_t total_bytes;     /* bytes held in the chunks above */
+	size_t limit_bytes;     /* stop the capture once this is reached */
 };
 
 static uint64_t limit_samples = 0;
@@ -41,6 +61,53 @@ static uint64_t limit_frames = 0;
 #ifdef HAVE_SRD
 extern struct srd_session *srd_sess;
 #endif
+
+/*
+ * How much physical memory is left, in bytes, or 0 if it cannot be found out.
+ */
+static uint64_t available_memory_bytes(void)
+{
+#ifdef _WIN32
+	MEMORYSTATUSEX statex;
+	statex.dwLength = sizeof(statex);
+	if (!GlobalMemoryStatusEx(&statex))
+		return 0;
+
+	return (uint64_t)statex.ullAvailPhys;
+#elif defined(__APPLE__)
+	vm_size_t page_size = 0;
+	if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS)
+		return 0;
+
+	vm_statistics64_data_t vmstat;
+	mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+	if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+	    (host_info64_t)&vmstat, &count) != KERN_SUCCESS)
+		return 0;
+
+	return (uint64_t)(vmstat.free_count + vmstat.inactive_count) *
+		(uint64_t)page_size;
+#else
+	long avail_kb = -1;
+	FILE *f = fopen("/proc/meminfo", "r");
+	if (f) {
+		char line[256];
+		while (fgets(line, sizeof(line), f)) {
+			if (sscanf(line, "MemAvailable: %ld kB", &avail_kb) == 1)
+				break;
+		}
+		fclose(f);
+	}
+	if (avail_kb >= 0)
+		return (uint64_t)avail_kb * 1024;
+
+	struct sysinfo si;
+	if (sysinfo(&si) == 0)
+		return (uint64_t)si.freeram * si.mem_unit;
+
+	return 0;
+#endif
+}
 
 static void memory_buffer_add_chunk(struct memory_buffer *mbuf,
 		const void *data, size_t length, size_t unit_size)
@@ -57,6 +124,7 @@ static void memory_buffer_add_chunk(struct memory_buffer *mbuf,
 	mbuf->chunks[mbuf->chunk_count] = g_memdup(data, length);
 	mbuf->chunk_sizes[mbuf->chunk_count] = length;
 	mbuf->chunk_count++;
+	mbuf->total_bytes += length;
 	if (unit_size > 0) {
 		mbuf->unit_size = unit_size;
 		mbuf->total_samples += length / unit_size;
@@ -428,6 +496,17 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 			oa = sr_output_new(sr_output_find("analog"), NULL,
 					sdi, NULL);
 
+		/*
+		 * Collect the capture in memory and write it out in one go at the
+		 * end. That is what the output modules need: srzip rewrites the
+		 * whole archive on every append, so handing it the data as it
+		 * arrives makes writing quadratic in the size of the capture and
+		 * the capture falls behind.
+		 *
+		 * The buffer is capped at a share of the memory that is free (see
+		 * the check on it in datafeed_in()); without a cap, a long capture
+		 * at a high sample rate takes the machine down with it instead.
+		 */
 		if (!opt_pds && opt_output_file) {
 			if (mbuf) {
 				memory_buffer_free(mbuf);
@@ -435,7 +514,10 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 			}
 			mbuf = g_malloc0(sizeof(struct memory_buffer));
 			mbuf->samplerate = samplerate;
-			g_debug("Memory-first capture mode: buffering logic data in memory");
+			mbuf->limit_bytes = (size_t)(available_memory_bytes() *
+				MEMORY_BUFFER_SHARE_PERCENT / 100);
+			g_debug("Memory-first capture mode: buffering up to %zu bytes in memory",
+				mbuf->limit_bytes);
 		}
 
 		rcvd_samples_logic = rcvd_samples_analog = 0;
@@ -549,6 +631,20 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 			if (limit_samples && rcvd_samples_logic >= limit_samples) {
 				g_message("cli: Sample limit reached (%" PRIu64 "), stopping session.",
 					rcvd_samples_logic);
+				sr_session_stop(session);
+			} else if (mbuf->limit_bytes &&
+				   mbuf->total_bytes >= mbuf->limit_bytes) {
+				/*
+				 * The room set aside for the capture is used up. Stop
+				 * here instead of letting the machine run out of
+				 * memory: once it starts swapping, the capture is no
+				 * longer reliable and the window stops responding.
+				 * What was captured so far is still written out at
+				 * the end.
+				 */
+				g_message("cli: Memory buffer full (%" G_GSIZE_FORMAT
+					" bytes, limit %" G_GSIZE_FORMAT "), stopping session.",
+					mbuf->total_bytes, mbuf->limit_bytes);
 				sr_session_stop(session);
 			}
 			break;
@@ -1056,15 +1152,27 @@ void run_session(void)
 		return;
 	}
 
-	if (opt_configs) {
-		if (set_dev_options_array(sdi, opt_configs) != SR_OK)
-			return;
-	}
-
+	/*
+	 * The channels have to be in place before the other options are
+	 * set. Which of the two widths the device is put into decides what
+	 * sample rates it offers, so a rate set beforehand would be thrown
+	 * away when the width is switched.
+	 */
 	if (select_channels(sdi) != SR_OK) {
 		g_critical("Failed to set channels.");
 		sr_session_destroy(session);
 		return;
+	}
+
+	if (apply_logic_channel_count(sdi) != SR_OK) {
+		g_critical("Failed to set the channel count.");
+		sr_session_destroy(session);
+		return;
+	}
+
+	if (opt_configs) {
+		if (set_dev_options_array(sdi, opt_configs) != SR_OK)
+			return;
 	}
 
 	trigger = NULL;
