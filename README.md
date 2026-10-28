@@ -1,83 +1,88 @@
-# CH32H417\-sigrok\-cli
+[English](README.md) | [中文](README_zh.md)
 
-适配 CH32H417 逻辑分析仪的优化版 sigrok\-cli，搭配 sigrok\-mcp\-server，通过 MCP 协议对接 WorkBuddy 等 AI，**自然语言操控硬件采集、解码、自动时序分析**。
+# CH32H417-sigrok-cli
 
-## 硬件简介
+An optimized sigrok-cli for the CH32H417 logic analyzer. Paired with sigrok-mcp-server, it talks to AI agents such as WorkBuddy over MCP, so you can **drive hardware capture, protocol decoding and timing analysis in natural language**.
 
-基于CH32H417 双核 RISC\-V 单芯片打造的逻辑分析仪，无需 FPGA
+## Hardware
 
-- 最高 200MHz 数字采样 / 20Msps 模拟采样
+A logic analyzer built on the CH32H417 dual-core RISC-V SoC — no FPGA involved.
 
-- 16 路数字 \+ 2 路模拟通道，USB3\.0 高速传输
-硬件开源工程：立创开源
+- Up to 200 MHz digital sampling / 20 Msps analog sampling
 
-## 核心能力
+- 16 digital + 2 analog channels, USB 3.0 high-speed transfer
 
-1. 设备自动自检，AI 识别 CH32H417 分析仪
+Hardware project: LCEDA Open Source (立创开源)
 
-2. 自然语言下发采集任务，SPI/UART/I2C 自动解码
+## Key capabilities
 
-3. 自动分析时序抖动、收发延迟，输出故障分析报告
+1. Automatic device self-check — the AI recognizes the CH32H417 analyzer
 
-## 环境依赖
+2. Capture tasks issued in natural language, with automatic SPI/UART/I2C decoding
 
-### 硬件
+3. Automatic analysis of timing jitter and TX/RX latency, producing a fault report
 
-- CH32H417 USB3\.0 逻辑分析仪
+## Requirements
 
-- USB3\.0 数据线、CH372 驱动
+### Hardware
 
-### 软件
+- CH32H417 USB 3.0 logic analyzer
 
-- Windows 系统
+- USB 3.0 cable and the CH372 driver
 
-- 本项目优化 sigrok\-cli \+ sigrok\-mcp\-server
+### Software
 
-- 支持 MCP 的 AI Agent（WorkBuddy）
+- Windows
 
-## 快速部署
+- The optimized sigrok-cli from this project + sigrok-mcp-server
 
-1. 克隆仓库，全部文件放**纯英文路径**
+- An MCP-capable AI agent (WorkBuddy)
 
-2. 安装 CH372 驱动，配置环境变量 `SIGROK_CLI_PATH`
+## Quick start
 
-3. AI 客户端填入下方 MCP 配置，启动服务即可使用
+1. Clone the repository and keep all files under a **pure-ASCII path** (no Chinese characters)
+
+2. Install the CH372 driver and set the `SIGROK_CLI_PATH` environment variable
+
+3. Paste the MCP config below into your AI client, then approve the server under "Custom connectors" (it does not start until trusted)
 
 ```json
 {
-  "sigrok": {
-    "command": "%WORKSPACE%/sigrok-mcp-server.exe",
-    "args": [],
-    "env": {
-      "SIGROK_CLI_PATH": "%WORKSPACE%/sigrok-cli/sigrok-cli.exe",
-      "SIGROK_TIMEOUT_SECONDS": "600",
-      "SIGROK_WORKING_DIR": "%WORKSPACE%/sigrok-cli",
-      "PYTHONHOME": "%WORKSPACE%/sigrok-cli/python-portable",
-      "PYTHONPATH": "%WORKSPACE%/sigrok-cli/python-portable/lib/python3.14",
-      "SIGROKDECODE_DIR": "%WORKSPACE%/sigrok-cli/decoders",
-      "PYTHONDONTWRITEBYTECODE": "1",
-      "PATH": "%WORKSPACE%/sigrok-cli;${PATH}"
-    },
-    "disabled": false
+  "mcpServers": {
+    "sigrok": {
+      "command": "%WORKSPACE%/sigrok-mcp-server.exe",
+      "args": [],
+      "env": {
+        "SIGROK_CLI_PATH": "%WORKSPACE%/sigrok-cli/sigrok-cli.exe",
+        "SIGROK_TIMEOUT_SECONDS": "600",
+        "SIGROK_WORKING_DIR": "%WORKSPACE%/sigrok-cli/workdir"
+      },
+      "disabled": false
+    }
   }
 }
 ```
 
-**配置说明**：将`%WORKSPACE%` 替换为你的项目实际根目录（文件夹纯英文、无空格、无中文），支持 Windows 任意磁盘路径，适配所有本地部署环境。
+**Note**: replace `%WORKSPACE%` with your actual project root (ASCII only, no spaces, no Chinese characters). Any Windows drive path works.
 
-## 应用场景
+`SIGROK_WORKING_DIR` is where the server writes temporary capture files; create it beforehand. `SIGROK_TIMEOUT_SECONDS` is the per-operation timeout — raise it for long captures.
 
-- 研发调试：长时间无人挂测，捕捉偶发通信故障
+No `PYTHONHOME` / `PYTHONPATH` / `SIGROKDECODE_DIR` needed: sigrok-cli derives them from its own directory at startup, so the portable Python and the decoders only have to sit next to the executable.
 
-- 产线自动化：批量自动检测总线时序、通信异常
+## Use cases
 
-- 可扩展：后续支持 I3C、SAI 等总线协议
+- Development debugging: unattended long-duration capture for intermittent communication faults
 
-## 引用开源项目
+- Production-line automation: batch checks of bus timing and communication anomalies
 
-1. [sigrokproject/sigrok\-cli](https://github.com/sigrokproject/sigrok-cli) \(GPL\-3\.0\)
+- Extensible: I3C, SAI and more bus protocols planned
 
-2. [KenosInc/sigrok\-mcp\-server](https://github.com/KenosInc/sigrok-mcp-server) \(MIT\)
+## Open source projects used
 
-## 详细介绍
+1. [sigrokproject/sigrok-cli](https://github.com/sigrokproject/sigrok-cli) (GPL-3.0)
+
+2. [KenosInc/sigrok-mcp-server](https://github.com/KenosInc/sigrok-mcp-server) (MIT)
+
+## More details
+
 [https://blog.csdn.net/qq_43010294/article/details/163077606](https://blog.csdn.net/qq_43010294/article/details/163077606)
