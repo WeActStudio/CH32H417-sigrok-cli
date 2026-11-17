@@ -440,6 +440,7 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 	static int triggered = 0;
 	static FILE *outfile = NULL;
 	static struct memory_buffer *mbuf = NULL;
+	static gboolean stop_requested = FALSE;
 
 	const struct sr_datafeed_meta *meta;
 	const struct sr_datafeed_logic *logic;
@@ -473,6 +474,7 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 	switch (packet->type) {
 	case SR_DF_HEADER:
 		g_debug("cli: Received SR_DF_HEADER.");
+		stop_requested = FALSE;
 		if (maybe_config_get(driver, sdi, NULL, SR_CONF_SAMPLERATE,
 				&gvar) == SR_OK) {
 			samplerate = g_variant_get_uint64(gvar);
@@ -613,7 +615,7 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 		if (limit_samples && rcvd_samples_logic >= limit_samples) {
 			g_message("cli: Already have enough samples (%"PRIu64" >= %"PRIu64"), stopping.",
 				rcvd_samples_logic, limit_samples);
-			sr_session_stop(session);
+			stop_requested = TRUE;
 			break;
 		}
 
@@ -631,7 +633,7 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 			if (limit_samples && rcvd_samples_logic >= limit_samples) {
 				g_message("cli: Sample limit reached (%" PRIu64 "), stopping session.",
 					rcvd_samples_logic);
-				sr_session_stop(session);
+				stop_requested = TRUE;
 			} else if (mbuf->limit_bytes &&
 				   mbuf->total_bytes >= mbuf->limit_bytes) {
 				/*
@@ -645,7 +647,7 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 				g_message("cli: Memory buffer full (%" G_GSIZE_FORMAT
 					" bytes, limit %" G_GSIZE_FORMAT "), stopping session.",
 					mbuf->total_bytes, mbuf->limit_bytes);
-				sr_session_stop(session);
+				stop_requested = TRUE;
 			}
 			break;
 		}
@@ -738,7 +740,7 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 			if (srd_session_send(srd_sess, rcvd_samples_logic, end_sample,
 					logic->data, input_len, logic->unitsize,
 					constant_mask, constant_vals) != SRD_OK)
-				sr_session_stop(session);
+				stop_requested = TRUE;
 #endif
 
 				/* 检查是否这是最后一块数据，如果是则发送 EOF */
@@ -761,7 +763,7 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 					srd_session_send_eof(srd_sess);
 				}
 #endif
-			sr_session_stop(session);
+			stop_requested = TRUE;
 		}
 		break;
 
@@ -866,6 +868,17 @@ void datafeed_in(const struct sr_dev_inst *sdi,
 				g_warning("Device only sent %" PRIu64 " samples.",
 					   rcvd_samples_analog);
 		}
+	}
+
+	/*
+	 * Stop only after this packet has been handed to the output module.
+	 * sr_session_stop() runs the stop synchronously in this thread, and the
+	 * drivers answer it with SR_DF_END right away, which frees the output
+	 * module. Doing that in the middle of the packet would drop its samples.
+	 */
+	if (stop_requested) {
+		stop_requested = FALSE;
+		sr_session_stop(session);
 	}
 
 }
@@ -1137,9 +1150,13 @@ void run_session(void)
 	g_slist_free(real_devices);
 
 	sr_session_new(sr_ctx, &session);
+	/*
+	 * The datafeed callback stops the session once a limit is reached, so
+	 * it needs the pointer. Clearing it before registration would turn
+	 * every sr_session_stop() call in there into a no-op.
+	 */
 	df_arg.session = session;
 	sr_session_datafeed_callback_add(session, datafeed_in, &df_arg);
-	df_arg.session = NULL;
 
 	if (sr_dev_open(sdi) != SR_OK) {
 		g_critical("Failed to open device.");
@@ -1277,5 +1294,6 @@ void run_session(void)
 
 	sr_session_datafeed_callback_remove_all(session);
 	g_main_loop_unref(main_loop);
+	df_arg.session = NULL;
 	sr_session_destroy(session);
 }
