@@ -83,6 +83,10 @@
 
 2. [KenosInc/sigrok-mcp-server](https://github.com/KenosInc/sigrok-mcp-server) (MIT)
 
+## 参与开发
+
+提交信息使用英文书写：首行说明改动内容，正文简要说明改动原因，以便所有使用者都能读懂公开的提交历史。2026 年 11 月之前的提交信息为中文，保持原样不再修改。
+
 ## 详细介绍
 
 [https://blog.csdn.net/qq_43010294/article/details/163077606](https://blog.csdn.net/qq_43010294/article/details/163077606)

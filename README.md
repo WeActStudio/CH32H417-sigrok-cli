@@ -83,6 +83,10 @@ No `PYTHONHOME` / `PYTHONPATH` / `SIGROKDECODE_DIR` needed: sigrok-cli derives t
 
 2. [KenosInc/sigrok-mcp-server](https://github.com/KenosInc/sigrok-mcp-server) (MIT)
 
+## Contributing
+
+Commit messages are written in English: a single line describing what changed, followed by a short body explaining why. This keeps the public history readable for everyone. Commit messages dated before November 2026 are in Chinese and are left as they are.
+
 ## More details
 
 [https://blog.csdn.net/qq_43010294/article/details/163077606](https://blog.csdn.net/qq_43010294/article/details/163077606)
